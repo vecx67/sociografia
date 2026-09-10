@@ -1,21 +1,23 @@
 package com.soft4all.fireremote;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
-import android.content.Intent;
-import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioFormat;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
-import android.speech.RecognizerIntent;
-import android.text.InputType;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.widget.*;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 import java.net.Inet4Address;
 import java.net.InetSocketAddress;
@@ -23,513 +25,304 @@ import java.net.NetworkInterface;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Locale;
-import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import dadb.AdbKeyPair;
-import dadb.Dadb;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.WebSocket;
+import okhttp3.WebSocketListener;
+import okio.ByteString;
 
 public class MainActivity extends Activity {
-    private static final int BG = Color.rgb(7, 14, 23);
-    private static final int REMOTE = Color.rgb(16, 22, 29);
-    private static final int BUTTON = Color.rgb(38, 47, 57);
-    private static final int BLUE = Color.rgb(24, 119, 246);
-    private static final int ORANGE = Color.rgb(255, 112, 28);
-    private static final int GREEN = Color.rgb(57, 211, 132);
-    private static final int MUTED = Color.rgb(165, 178, 192);
-    private static final int VOICE_REQ = 5105;
+    private static final String API_KEY = "0987654321";
+    private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+    private static final int MIC_REQ = 6106;
+
+    private static final int BG = Color.rgb(7,14,23);
+    private static final int PANEL = Color.rgb(16,22,29);
+    private static final int BTN = Color.rgb(38,47,57);
+    private static final int BLUE = Color.rgb(24,119,246);
+    private static final int ORANGE = Color.rgb(255,112,28);
+    private static final int GREEN = Color.rgb(57,211,132);
+    private static final int MUTED = Color.rgb(165,178,192);
 
     private final ExecutorService discovery = Executors.newSingleThreadExecutor();
-    private final ThreadPoolExecutor control = new ThreadPoolExecutor(
-            1, 1, 0L, TimeUnit.MILLISECONDS,
-            new ArrayBlockingQueue<>(4),
-            new ThreadPoolExecutor.DiscardOldestPolicy());
-    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final ExecutorService control = Executors.newSingleThreadExecutor();
+    private final ExecutorService audioExec = Executors.newSingleThreadExecutor();
 
-    private Dadb adb;
-    private SharedPreferences prefs;
+    private OkHttpClient http;
     private LinearLayout root;
     private TextView status;
     private EditText textInput;
+    private android.content.SharedPreferences prefs;
+    private String host;
+    private String token;
     private volatile boolean scanning;
-    private volatile String connectedHost;
+    private volatile boolean voiceActive;
+    private AudioRecord recorder;
+    private WebSocket voiceSocket;
 
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
-        System.setProperty("user.home", getFilesDir().getAbsolutePath());
-        prefs = getSharedPreferences("fire_remote", MODE_PRIVATE);
+    @Override public void onCreate(Bundle b) {
+        super.onCreate(b);
+        prefs = getSharedPreferences("fire_remote_v6", MODE_PRIVATE);
+        http = unsafeClient();
         showDiscovery();
     }
 
+    private OkHttpClient unsafeClient() {
+        try {
+            final X509TrustManager tm = new X509TrustManager() {
+                public void checkClientTrusted(java.security.cert.X509Certificate[] x, String a) {}
+                public void checkServerTrusted(java.security.cert.X509Certificate[] x, String a) {}
+                public java.security.cert.X509Certificate[] getAcceptedIssuers() { return new java.security.cert.X509Certificate[0]; }
+            };
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, new TrustManager[]{tm}, new java.security.SecureRandom());
+            SSLSocketFactory sf = sc.getSocketFactory();
+            return new OkHttpClient.Builder()
+                    .sslSocketFactory(sf, tm)
+                    .hostnameVerifier((h,s) -> true)
+                    .connectTimeout(900, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .readTimeout(1800, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .writeTimeout(1800, java.util.concurrent.TimeUnit.MILLISECONDS)
+                    .retryOnConnectionFailure(true)
+                    .build();
+        } catch (Exception e) { throw new RuntimeException(e); }
+    }
+
     private int dp(float v) { return Math.round(v * getResources().getDisplayMetrics().density); }
-
-    private GradientDrawable rounded(int color, float radius) {
-        GradientDrawable g = new GradientDrawable();
-        g.setColor(color);
-        g.setCornerRadius(dp(radius));
-        return g;
+    private GradientDrawable shape(int color, float radius) {
+        GradientDrawable g = new GradientDrawable(); g.setColor(color); g.setCornerRadius(dp(radius)); return g;
     }
-
-    private GradientDrawable outlined(int color, int stroke, float radius) {
-        GradientDrawable g = rounded(color, radius);
-        g.setStroke(dp(1), stroke);
-        return g;
+    private GradientDrawable outline(int color, int stroke, float radius) {
+        GradientDrawable g = shape(color, radius); g.setStroke(dp(1), stroke); return g;
     }
-
-    private TextView text(String value, int sp, int color, boolean bold) {
-        TextView v = new TextView(this);
-        v.setText(value);
-        v.setTextSize(sp);
-        v.setTextColor(color);
-        v.setGravity(Gravity.CENTER_VERTICAL);
-        v.setPadding(dp(10), dp(8), dp(10), dp(8));
-        if (bold) v.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        return v;
+    private TextView text(String s, int sp, int color, boolean bold) {
+        TextView v = new TextView(this); v.setText(s); v.setTextSize(sp); v.setTextColor(color); v.setGravity(Gravity.CENTER_VERTICAL);
+        v.setPadding(dp(10),dp(7),dp(10),dp(7)); if (bold) v.setTypeface(Typeface.DEFAULT, Typeface.BOLD); return v;
     }
-
-    private Button button(String label, int color) {
-        Button b = new Button(this);
-        b.setText(label);
-        b.setAllCaps(false);
-        b.setTextColor(Color.WHITE);
-        b.setTextSize(15);
-        b.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        b.setPadding(dp(5), dp(5), dp(5), dp(5));
-        b.setBackground(rounded(color, 100));
-        b.setSoundEffectsEnabled(false);
-        return b;
+    private Button button(String s, int color) {
+        Button b = new Button(this); b.setText(s); b.setAllCaps(false); b.setTextColor(Color.WHITE); b.setTextSize(15);
+        b.setTypeface(Typeface.DEFAULT, Typeface.BOLD); b.setBackground(shape(color, 100)); b.setSoundEffectsEnabled(false); return b;
     }
-
-    private LinearLayout row() {
-        LinearLayout r = new LinearLayout(this);
-        r.setOrientation(LinearLayout.HORIZONTAL);
-        r.setGravity(Gravity.CENTER);
-        return r;
-    }
-
-    private void flex(LinearLayout r, View v, int height) {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0, dp(height), 1f);
-        p.setMargins(dp(5), dp(5), dp(5), dp(5));
-        r.addView(v, p);
-    }
-
+    private LinearLayout row() { LinearLayout r=new LinearLayout(this); r.setOrientation(LinearLayout.HORIZONTAL); r.setGravity(Gravity.CENTER); return r; }
+    private void flex(LinearLayout r, View v, int h) { LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(0,dp(h),1); p.setMargins(dp(5),dp(5),dp(5),dp(5)); r.addView(v,p); }
     private void prepareRoot() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setFillViewport(true);
-        scroll.setBackgroundColor(BG);
-        root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(14), dp(14), dp(14), dp(30));
-        root.setBackgroundColor(BG);
-        scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
-        setContentView(scroll);
+        ScrollView s = new ScrollView(this); s.setFillViewport(true); s.setBackgroundColor(BG);
+        root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(14),dp(14),dp(14),dp(28)); root.setBackgroundColor(BG);
+        s.addView(root,new ScrollView.LayoutParams(-1,-2)); setContentView(s);
     }
-
-    private void addBrand() {
-        TextView title = text("Soft4All  Fire Remote", 25, Color.WHITE, true);
-        title.setGravity(Gravity.CENTER);
-        root.addView(title);
-        TextView sub = text("Fire TV 4K Remote · V5", 13, ORANGE, true);
-        sub.setGravity(Gravity.CENTER);
-        root.addView(sub);
+    private void brand() {
+        TextView t=text("Soft4All  Fire Remote",25,Color.WHITE,true); t.setGravity(Gravity.CENTER); root.addView(t);
+        TextView s=text("Fire TV 4K Remote · V6 · sin ADB",13,ORANGE,true); s.setGravity(Gravity.CENTER); root.addView(s);
     }
 
     private void showDiscovery() {
-        prepareRoot();
-        addBrand();
-        TextView h = text("Selecciona tu Fire TV", 20, Color.WHITE, true);
-        h.setGravity(Gravity.CENTER);
-        h.setPadding(0, dp(18), 0, dp(4));
-        root.addView(h);
-        status = text("Buscando dispositivos en tu red…", 14, MUTED, false);
-        status.setGravity(Gravity.CENTER);
-        root.addView(status);
-        ProgressBar pb = new ProgressBar(this);
-        LinearLayout.LayoutParams pp = new LinearLayout.LayoutParams(dp(42), dp(42));
-        pp.gravity = Gravity.CENTER;
-        pp.setMargins(0, dp(8), 0, dp(8));
-        root.addView(pb, pp);
-
-        LinearLayout devices = new LinearLayout(this);
-        devices.setId(9001);
-        devices.setOrientation(LinearLayout.VERTICAL);
-        root.addView(devices);
-
-        String last = prefs.getString("last_ip", "");
-        if (!last.isEmpty()) addDeviceCard(devices, last, "Último Fire TV usado");
-
-        Button again = button("↻  Buscar de nuevo", BUTTON);
-        again.setOnClickListener(v -> startScan());
-        LinearLayout.LayoutParams ap = new LinearLayout.LayoutParams(-1, dp(56));
-        ap.setMargins(0, dp(12), 0, 0);
-        root.addView(again, ap);
+        prepareRoot(); brand();
+        TextView h=text("Busca y enlaza tu Fire TV",20,Color.WHITE,true); h.setGravity(Gravity.CENTER); h.setPadding(0,dp(18),0,dp(4)); root.addView(h);
+        status=text("Buscando Fire TV en tu red…",14,MUTED,false); status.setGravity(Gravity.CENTER); root.addView(status);
+        LinearLayout devices=new LinearLayout(this); devices.setId(9001); devices.setOrientation(LinearLayout.VERTICAL); root.addView(devices);
+        String last=prefs.getString("last_ip",""); if(!last.isEmpty()) addDeviceCard(devices,last,"Último Fire TV");
+        Button scan=button("↻ Buscar de nuevo",BTN); scan.setOnClickListener(v->startScan()); root.addView(scan,new LinearLayout.LayoutParams(-1,dp(56)));
+        TextView note=text("No necesita ADB. La primera vez el Fire TV mostrará un PIN de 4 cifras para enlazar.",12,MUTED,false); note.setGravity(Gravity.CENTER); root.addView(note);
         startScan();
     }
 
     private void startScan() {
-        if (scanning) return;
-        LinearLayout devices = findViewById(9001);
-        if (devices == null) return;
-        scanning = true;
-        status.setText("Buscando dispositivos en tu red…");
-
+        if(scanning) return;
+        LinearLayout devices=findViewById(9001); if(devices==null) return;
+        scanning=true; status.setText("Buscando Fire TV en tu red…");
         discovery.execute(() -> {
-            String myIp = localIpv4();
-            if (myIp == null || !myIp.contains(".")) {
-                runOnUiThread(() -> {
-                    scanning = false;
-                    status.setText("No pude identificar la red local.");
-                });
-                return;
-            }
-            String base = myIp.substring(0, myIp.lastIndexOf('.') + 1);
-            ExecutorService pool = Executors.newFixedThreadPool(64);
-            AtomicInteger pending = new AtomicInteger(254);
-            AtomicInteger found = new AtomicInteger();
-            Set<String> seen = Collections.newSetFromMap(new ConcurrentHashMap<>());
-
-            for (int i = 1; i <= 254; i++) {
-                final String host = base + i;
+            String me=localIpv4();
+            if(me==null){ runOnUiThread(()->{scanning=false;status.setText("No pude identificar la red Wi‑Fi.");}); return; }
+            String base=me.substring(0,me.lastIndexOf('.')+1);
+            ExecutorService pool=Executors.newFixedThreadPool(64); AtomicInteger pending=new AtomicInteger(254), found=new AtomicInteger();
+            for(int i=1;i<=254;i++){
+                final String ip=base+i;
                 pool.execute(() -> {
                     try {
-                        if (!host.equals(myIp) && portOpen(host, 5555, 90) && seen.add(host)) {
-                            int n = found.incrementAndGet();
-                            runOnUiThread(() -> {
-                                addDeviceCard(devices, host, "Fire TV / Android detectado");
-                                status.setText("Encontrados: " + n);
-                            });
+                        if(!ip.equals(me) && (portOpen(ip,8080,80) || portOpen(ip,8009,80))) {
+                            int n=found.incrementAndGet(); runOnUiThread(()->{addDeviceCard(devices,ip,"Fire TV detectado");status.setText("Encontrados: "+n);});
                         }
                     } finally {
-                        if (pending.decrementAndGet() == 0) {
-                            pool.shutdown();
-                            scanning = false;
-                            runOnUiThread(() -> status.setText(found.get() == 0
-                                    ? "No encontré ningún Fire TV con ADB disponible."
-                                    : "Búsqueda terminada · " + found.get() + " dispositivo(s)"));
-                        }
+                        if(pending.decrementAndGet()==0){pool.shutdown();scanning=false;runOnUiThread(()->status.setText(found.get()==0?"No encontré ningún Fire TV encendido en la red.":"Búsqueda terminada · "+found.get()+" dispositivo(s)"));}
                     }
                 });
             }
         });
     }
 
-    private void addDeviceCard(LinearLayout devices, String host, String name) {
-        LinearLayout card = new LinearLayout(this);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(14), dp(10), dp(14), dp(10));
-        card.setBackground(outlined(Color.rgb(18, 31, 45), BLUE, 18));
-        card.addView(text("▰  " + name, 16, Color.WHITE, true));
-        card.addView(text(host, 14, Color.rgb(128, 194, 255), false));
-        card.setOnClickListener(v -> connectHost(host));
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(-1, -2);
-        p.setMargins(0, dp(5), 0, dp(5));
-        devices.addView(card, p);
+    private void addDeviceCard(LinearLayout devices,String ip,String name){
+        LinearLayout c=new LinearLayout(this); c.setOrientation(LinearLayout.VERTICAL); c.setPadding(dp(14),dp(9),dp(14),dp(9)); c.setBackground(outline(Color.rgb(18,31,45),BLUE,18));
+        c.addView(text("▰  "+name,16,Color.WHITE,true)); c.addView(text(ip,14,Color.rgb(128,194,255),false)); c.setOnClickListener(v->pairOrConnect(ip));
+        LinearLayout.LayoutParams p=new LinearLayout.LayoutParams(-1,-2); p.setMargins(0,dp(5),0,dp(5)); devices.addView(c,p);
     }
 
-    private void connectHost(String host) {
-        if (status != null) status.setText("Enlazando con " + host + "…");
+    private void pairOrConnect(String ip){
+        host=ip; token=prefs.getString("token_"+ip,"");
+        if(status!=null) status.setText("Conectando con "+ip+"…");
         discovery.execute(() -> {
-            try {
-                if (adb != null) adb.close();
-                adb = Dadb.create(host, 5555, AdbKeyPair.readDefault(), 1200, 1200, true);
-                String probe = adb.shell("echo Soft4All_OK").getAllOutput();
-                if (!probe.contains("Soft4All_OK")) throw new Exception("ADB probe failed");
-                connectedHost = host;
-                String maker = adb.shell("getprop ro.product.manufacturer").getAllOutput().trim();
-                String model = adb.shell("getprop ro.product.model").getAllOutput().trim();
-                prefs.edit().putString("last_ip", host).apply();
-                final String device = (maker + " " + model).trim().isEmpty() ? "Fire TV 4K" : (maker + " " + model).trim();
-                runOnUiThread(() -> showRemote(host, device));
-            } catch (Exception e) {
-                runOnUiThread(() -> {
-                    if (status != null) status.setText("No se pudo enlazar. Acepta la autorización ADB en el Fire TV y vuelve a tocarlo.");
-                });
-            }
+            wake(ip);
+            if(!token.isEmpty() && testToken(ip,token)) { prefs.edit().putString("last_ip",ip).apply(); runOnUiThread(()->showRemote(ip)); return; }
+            try { Thread.sleep(450); } catch(Exception ignored){}
+            if(displayPin(ip)) runOnUiThread(()->showPinDialog(ip));
+            else runOnUiThread(()->status.setText("El Fire TV responde, pero no pudo iniciarse el emparejamiento por PIN."));
         });
     }
 
-    private void showRemote(String host, String deviceName) {
-        prepareRoot();
-        addBrand();
-
-        LinearLayout info = row();
-        TextView connected = text("● " + deviceName + "\n" + host, 13, GREEN, true);
-        flex(info, connected, 58);
-        Button change = button("Cambiar TV", BUTTON);
-        change.setOnClickListener(v -> showDiscovery());
-        flex(info, change, 58);
-        root.addView(info);
-
-        LinearLayout body = new LinearLayout(this);
-        body.setOrientation(LinearLayout.VERTICAL);
-        body.setPadding(dp(14), dp(16), dp(14), dp(18));
-        body.setBackground(outlined(REMOTE, Color.rgb(48, 58, 69), 34));
-        LinearLayout.LayoutParams bp = new LinearLayout.LayoutParams(-1, -2);
-        bp.setMargins(0, dp(10), 0, dp(10));
-        root.addView(body, bp);
-
-        LinearLayout top = row();
-        Button power = button("⏻", Color.rgb(74, 31, 31)); power.setTextSize(22); power.setOnClickListener(v -> key(26));
-        Button voice = button("🎙", BLUE); voice.setTextSize(21); voice.setOnClickListener(v -> startVoice());
-        Button search = button("⌕", BUTTON); search.setTextSize(23); search.setOnClickListener(v -> key(84));
-        flex(top, power, 58); flex(top, voice, 58); flex(top, search, 58); body.addView(top);
-
-        TextView hint = text("Mantén pulsada la cruceta o el volumen para repetir", 11, MUTED, false);
-        hint.setGravity(Gravity.CENTER); body.addView(hint);
-
-        LinearLayout up = row();
-        Button bUp = remoteKey("▲", 19); flex(up, bUp, 76); body.addView(up);
-        LinearLayout mid = row();
-        Button bLeft = remoteKey("◀", 21); Button ok = remoteKey("OK", 23); ok.setTextSize(19); Button bRight = remoteKey("▶", 22);
-        flex(mid, bLeft, 76); flex(mid, ok, 76); flex(mid, bRight, 76); body.addView(mid);
-        LinearLayout down = row(); Button bDown = remoteKey("▼", 20); flex(down, bDown, 76); body.addView(down);
-
-        LinearLayout nav = row();
-        Button back = button("↩", BUTTON); back.setTextSize(22); back.setOnClickListener(v -> key(4));
-        Button home = button("⌂", BUTTON); home.setTextSize(23); home.setOnClickListener(v -> key(3));
-        Button menu = button("☰", BUTTON); menu.setTextSize(22); menu.setOnClickListener(v -> key(82));
-        flex(nav, back, 58); flex(nav, home, 58); flex(nav, menu, 58); body.addView(nav);
-
-        LinearLayout media = row();
-        Button rw = button("⏪", BUTTON); rw.setOnClickListener(v -> key(89));
-        Button pp = button("▶❚❚", BUTTON); pp.setOnClickListener(v -> key(85));
-        Button ff = button("⏩", BUTTON); ff.setOnClickListener(v -> key(90));
-        flex(media, rw, 58); flex(media, pp, 58); flex(media, ff, 58); body.addView(media);
-
-        LinearLayout volume = row();
-        Button mute = remoteKey("🔇", 164);
-        Button volDown = remoteKey("−", 25); volDown.setTextSize(25);
-        Button volUp = remoteKey("+", 24); volUp.setTextSize(25);
-        flex(volume, mute, 58); flex(volume, volDown, 58); flex(volume, volUp, 58); body.addView(volume);
-
-        TextView appsTitle = text("Accesos directos", 15, Color.WHITE, true); appsTitle.setGravity(Gravity.CENTER); appsTitle.setPadding(0, dp(14),0,dp(4)); body.addView(appsTitle);
-        LinearLayout apps1 = row();
-        flex(apps1, appButton("Prime", () -> launchCandidates("prime", new String[]{"com.amazon.cloud9","com.amazon.avod.thirdpartyclient","com.amazon.amazonvideo.livingroom"})), 54);
-        flex(apps1, appButton("Netflix", () -> launchCandidates("netflix", new String[]{"com.netflix.ninja"})), 54);
-        flex(apps1, appButton("Disney+", () -> launchCandidates("disney", new String[]{"com.disney.disneyplus"})), 54);
-        body.addView(apps1);
-        LinearLayout apps2 = row();
-        flex(apps2, appButton("Max", () -> launchCandidates("max", new String[]{"com.wbd.stream","com.hbo.hbonow","com.discovery.discoplus"})), 54);
-        Button custom1 = customButton(1); Button custom2 = customButton(2);
-        flex(apps2, custom1, 54); flex(apps2, custom2, 54); body.addView(apps2);
-
-        TextView configHint = text("Mantén pulsado APP 1 o APP 2 para cambiar su aplicación", 11, MUTED, false);
-        configHint.setGravity(Gravity.CENTER); body.addView(configHint);
-
-        TextView extras = text("Más controles", 16, Color.WHITE, true); extras.setGravity(Gravity.CENTER); extras.setPadding(0,dp(12),0,dp(4)); root.addView(extras);
-
-        LinearLayout extra1 = row();
-        Button prev = button("⏮ Anterior", BUTTON); prev.setOnClickListener(v -> key(88));
-        Button next = button("Siguiente ⏭", BUTTON); next.setOnClickListener(v -> key(87));
-        flex(extra1, prev, 54); flex(extra1, next, 54); root.addView(extra1);
-
-        LinearLayout extra2 = row();
-        Button play = button("▶ Play", BUTTON); play.setOnClickListener(v -> key(126));
-        Button pause = button("❚❚ Pausa", BUTTON); pause.setOnClickListener(v -> key(127));
-        flex(extra2, play, 54); flex(extra2, pause, 54); root.addView(extra2);
-
-        textInput = new EditText(this);
-        textInput.setSingleLine(true);
-        textInput.setTextColor(Color.WHITE);
-        textInput.setHintTextColor(MUTED);
-        textInput.setHint("Escribe en el Fire TV…");
-        textInput.setInputType(InputType.TYPE_CLASS_TEXT);
-        textInput.setBackground(outlined(Color.rgb(18,31,45), Color.rgb(62,82,104), 14));
-        textInput.setPadding(dp(14),0,dp(14),0);
-        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(-1, dp(54));
-        tp.setMargins(dp(5),dp(6),dp(5),dp(5)); root.addView(textInput,tp);
-
-        LinearLayout keyboard = row();
-        Button send = button("Enviar texto", BLUE); send.setOnClickListener(v -> sendText());
-        Button del = button("⌫", BUTTON); del.setOnClickListener(v -> key(67));
-        Button enter = button("Enter", BUTTON); enter.setOnClickListener(v -> key(66));
-        flex(keyboard, send,54); flex(keyboard,del,54); flex(keyboard,enter,54); root.addView(keyboard);
-
-        TextView note = text("V5 · El botón de voz usa el reconocimiento del móvil y envía el texto al buscador del Fire TV. ADB debe estar autorizado.", 11, MUTED, false);
-        note.setGravity(Gravity.CENTER); note.setPadding(dp(8),dp(14),dp(8),0); root.addView(note);
+    private void showPinDialog(String ip){
+        EditText pin=new EditText(this); pin.setHint("PIN de 4 cifras"); pin.setInputType(android.text.InputType.TYPE_CLASS_NUMBER); pin.setGravity(Gravity.CENTER);
+        AlertDialog d=new AlertDialog.Builder(this).setTitle("Enlazar Fire TV").setMessage("Mira el PIN que aparece en la televisión e introdúcelo aquí.").setView(pin)
+                .setNegativeButton("Cancelar",null).setPositiveButton("Enlazar",null).create();
+        d.setOnShowListener(x->d.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v->{String p=pin.getText().toString().trim(); if(p.length()!=4){pin.setError("Introduce las 4 cifras");return;} verifyPin(ip,p,d);}));
+        d.show();
     }
 
-    private Button remoteKey(String label, int keyCode) {
-        Button b = button(label, BUTTON);
-        b.setTextSize(23);
-        b.setBackground(outlined(BUTTON, Color.rgb(67,79,91), 100));
-        bindRepeat(b, keyCode);
-        return b;
-    }
-
-    private void bindRepeat(Button b, int keyCode) {
-        final Handler h = new Handler(Looper.getMainLooper());
-        final Runnable[] repeater = new Runnable[1];
-        repeater[0] = () -> {
-            key(keyCode);
-            h.postDelayed(repeater[0], 115);
-        };
-        b.setOnTouchListener((v, event) -> {
-            if (event.getAction() == MotionEvent.ACTION_DOWN) {
-                key(keyCode);
-                h.postDelayed(repeater[0], 360);
-                return true;
+    private void verifyPin(String ip,String pin,AlertDialog dialog){
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(false);
+        discovery.execute(() -> {
+            String t="";
+            for(int i=0;i<3 && t.isEmpty();i++){
+                try {
+                    Response r=call(ip,"/v1/FireTV/pin/verify",false,"{\"pin\":\""+pin+"\"}","").execute();
+                    String body=r.body()!=null?r.body().string():""; r.close();
+                    if(!body.isEmpty()){String desc=new JSONObject(body).optString("description",""); if(!desc.equals("OK")) t=desc;}
+                    if(t.isEmpty()) Thread.sleep(250);
+                } catch(Exception ignored){}
             }
-            if (event.getAction() == MotionEvent.ACTION_UP || event.getAction() == MotionEvent.ACTION_CANCEL) {
-                h.removeCallbacks(repeater[0]);
-                return true;
-            }
-            return true;
+            final String tok=t;
+            runOnUiThread(() -> {
+                if(tok.isEmpty()){dialog.getButton(AlertDialog.BUTTON_POSITIVE).setEnabled(true);Toast.makeText(this,"PIN no aceptado o token no recibido",Toast.LENGTH_SHORT).show();}
+                else {token=tok;prefs.edit().putString("token_"+ip,tok).putString("last_ip",ip).apply();dialog.dismiss();showRemote(ip);}
+            });
         });
     }
 
-    private Button appButton(String label, Runnable action) {
-        Button b = button(label, Color.rgb(28, 68, 112));
-        b.setOnClickListener(v -> action.run());
-        return b;
+    private boolean displayPin(String ip){
+        try { Response r=call(ip,"/v1/FireTV/pin/display",false,"{\"friendlyName\":\"Soft4All Fire Remote\"}","").execute(); boolean ok=r.isSuccessful(); r.close(); return ok; } catch(Exception e){return false;}
+    }
+    private boolean testToken(String ip,String tok){
+        try { Request q=new Request.Builder().url("https://"+ip+":8080/v1/FireTV").header("X-Api-Key",API_KEY).header("X-Client-Token",tok).build(); Response r=http.newCall(q).execute(); boolean ok=r.code()!=401 && r.code()!=403; r.close(); return ok; } catch(Exception e){return false;}
+    }
+    private void wake(String ip){
+        try { Request q=new Request.Builder().url("http://"+ip+":8009/apps/FireTVRemote").post(RequestBody.create(new byte[0],null)).build(); Response r=http.newCall(q).execute(); r.close(); } catch(Exception ignored){}
     }
 
-    private Button customButton(int slot) {
-        String label = prefs.getString("custom" + slot + "_label", "APP " + slot);
-        String pkg = prefs.getString("custom" + slot + "_pkg", "");
-        Button b = button(pkg.isEmpty() ? "+ APP " + slot : label, Color.rgb(28, 68, 112));
-        b.setOnClickListener(v -> {
-            String p = prefs.getString("custom" + slot + "_pkg", "");
-            if (p.isEmpty()) configureCustom(slot, b);
-            else launchCandidates("custom" + slot, new String[]{p});
-        });
-        b.setOnLongClickListener(v -> { configureCustom(slot, b); return true; });
-        return b;
+    private Call call(String ip,String path,boolean auth,String body,String overrideToken){
+        Request.Builder b=new Request.Builder().url("https://"+ip+":8080"+path).header("X-Api-Key",API_KEY).header("Content-Type","application/json; charset=utf-8");
+        String t=overrideToken.isEmpty()?token:overrideToken; if(auth && t!=null && !t.isEmpty()) b.header("X-Client-Token",t);
+        b.post(RequestBody.create(body==null?"":body,JSON)); return http.newCall(b.build());
     }
 
-    private void configureCustom(int slot, Button target) {
-        final String[] labels = {"YouTube", "Spotify", "Plex", "Apple TV+", "DAZN", "RTVE Play", "Paquete personalizado"};
-        final String[] pkgs = {"com.amazon.firetv.youtube", "com.spotify.tv.android", "com.plexapp.android", "com.apple.atve.amazon.appletv", "com.dazn", "com.rtve.play", ""};
-        new AlertDialog.Builder(this)
-                .setTitle("Configurar APP " + slot)
-                .setItems(labels, (d, which) -> {
-                    if (which == labels.length - 1) showCustomPackageDialog(slot, target);
-                    else saveCustom(slot, labels[which], pkgs[which], target);
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
-    }
-
-    private void showCustomPackageDialog(int slot, Button target) {
-        EditText input = new EditText(this);
-        input.setHint("com.ejemplo.app");
-        input.setSingleLine(true);
-        new AlertDialog.Builder(this)
-                .setTitle("Paquete de la aplicación")
-                .setView(input)
-                .setPositiveButton("Guardar", (d,w) -> {
-                    String p = input.getText().toString().trim();
-                    if (!p.isEmpty()) saveCustom(slot, "APP " + slot, p, target);
-                })
-                .setNegativeButton("Cancelar", null)
-                .show();
-    }
-
-    private void saveCustom(int slot, String label, String pkg, Button target) {
-        prefs.edit().putString("custom" + slot + "_label", label).putString("custom" + slot + "_pkg", pkg).apply();
-        target.setText(label);
-    }
-
-    private void launchCandidates(String cacheKey, String[] candidates) {
-        if (adb == null) return;
+    private void sendNav(String action){ send("/v1/FireTV?action="+action,""); }
+    private void sendMedia(String action){ send("/v1/media?action="+action,""); }
+    private void sendScan(String dir){ send("/v1/media?action=scan&direction="+dir,""); }
+    private void send(String path,String body){
+        final String h=host,t=token; if(h==null||t==null||t.isEmpty()) return;
         control.execute(() -> {
-            try {
-                String cached = prefs.getString("resolved_" + cacheKey, "");
-                if (!cached.isEmpty() && packageExists(cached)) {
-                    adb.shell("monkey -p " + cached + " -c android.intent.category.LAUNCHER 1");
-                    return;
-                }
-                for (String p : candidates) {
-                    if (packageExists(p)) {
-                        prefs.edit().putString("resolved_" + cacheKey, p).apply();
-                        adb.shell("monkey -p " + p + " -c android.intent.category.LAUNCHER 1");
-                        return;
-                    }
-                }
-                runOnUiThread(() -> Toast.makeText(this, "Aplicación no encontrada en este Fire TV", Toast.LENGTH_SHORT).show());
-            } catch (Exception ignored) {}
+            try { Request.Builder b=new Request.Builder().url("https://"+h+":8080"+path).header("X-Api-Key",API_KEY).header("X-Client-Token",t).header("Content-Type","application/json; charset=utf-8");
+                Response r=http.newCall(b.post(RequestBody.create(body==null?"":body,JSON)).build()).execute(); r.close();
+            } catch(Exception e){ wake(h); }
         });
     }
 
-    private boolean packageExists(String pkg) throws Exception {
-        return adb.shell("pm path " + pkg).getAllOutput().contains("package:");
+    private void showRemote(String ip){
+        host=ip; token=prefs.getString("token_"+ip,token==null?"":token); prepareRoot(); brand();
+        TextView c=text("● Conectado · "+ip,13,GREEN,true); c.setGravity(Gravity.CENTER); root.addView(c);
+        LinearLayout shell=new LinearLayout(this); shell.setOrientation(LinearLayout.VERTICAL); shell.setPadding(dp(14),dp(16),dp(14),dp(18)); shell.setBackground(outline(PANEL,Color.rgb(48,58,69),34));
+        root.addView(shell,new LinearLayout.LayoutParams(-1,-2));
+
+        LinearLayout top=row();
+        Button power=button("⏻",Color.rgb(78,31,31)); power.setOnClickListener(v->sendNav("sleep"));
+        Button voice=button("🎙",BLUE); voice.setTextSize(21); voice.setOnTouchListener((v,e)->{if(e.getAction()==MotionEvent.ACTION_DOWN){startVoice();return true;} if(e.getAction()==MotionEvent.ACTION_UP||e.getAction()==MotionEvent.ACTION_CANCEL){stopVoice();return true;} return true;});
+        Button change=button("TV",BTN); change.setOnClickListener(v->showDiscovery());
+        flex(top,power,58);flex(top,voice,58);flex(top,change,58);shell.addView(top);
+
+        LinearLayout up=row(); Button bu=button("▲",BTN);bu.setOnClickListener(v->sendNav("dpad_up"));flex(up,bu,76);shell.addView(up);
+        LinearLayout mid=row(); Button bl=button("◀",BTN);bl.setOnClickListener(v->sendNav("dpad_left"));Button ok=button("OK",BTN);ok.setOnClickListener(v->sendNav("select"));Button br=button("▶",BTN);br.setOnClickListener(v->sendNav("dpad_right"));flex(mid,bl,76);flex(mid,ok,76);flex(mid,br,76);shell.addView(mid);
+        LinearLayout down=row();Button bd=button("▼",BTN);bd.setOnClickListener(v->sendNav("dpad_down"));flex(down,bd,76);shell.addView(down);
+
+        LinearLayout nav=row(); Button back=button("↩",BTN);back.setOnClickListener(v->sendNav("back"));Button home=button("⌂",BTN);home.setOnClickListener(v->sendNav("home"));Button menu=button("☰",BTN);menu.setOnClickListener(v->sendNav("menu"));flex(nav,back,58);flex(nav,home,58);flex(nav,menu,58);shell.addView(nav);
+        LinearLayout media=row();Button rw=button("⏪",BTN);rw.setOnClickListener(v->sendScan("back"));Button pp=button("▶❚❚",BTN);pp.setOnClickListener(v->sendMedia("play"));Button ff=button("⏩",BTN);ff.setOnClickListener(v->sendScan("forward"));flex(media,rw,58);flex(media,pp,58);flex(media,ff,58);shell.addView(media);
+        LinearLayout vol=row();Button mute=button("🔇",BTN);mute.setOnClickListener(v->sendNav("mute"));Button vd=button("−",BTN);vd.setOnClickListener(v->sendNav("volume_down"));Button vu=button("+",BTN);vu.setOnClickListener(v->sendNav("volume_up"));flex(vol,mute,58);flex(vol,vd,58);flex(vol,vu,58);shell.addView(vol);
+
+        TextView at=text("Accesos directos",15,Color.WHITE,true);at.setGravity(Gravity.CENTER);shell.addView(at);
+        LinearLayout a1=row();flex(a1,app("Prime",new String[]{"com.amazon.cloud9"}),54);flex(a1,app("Netflix",new String[]{"com.netflix.ninja"}),54);flex(a1,app("Disney+",new String[]{"com.disney.disneyplus"}),54);shell.addView(a1);
+        LinearLayout a2=row();flex(a2,app("Max",new String[]{"com.wbd.stream","com.hbo.hbonow","com.discovery.discoplus"}),54);flex(a2,customApp(1),54);flex(a2,customApp(2),54);shell.addView(a2);
+
+        TextView more=text("Más opciones",16,Color.WHITE,true);more.setGravity(Gravity.CENTER);more.setPadding(0,dp(14),0,dp(4));root.addView(more);
+        textInput=new EditText(this); textInput.setTextColor(Color.WHITE); textInput.setHintTextColor(MUTED); textInput.setHint("Escribe en el Fire TV…"); textInput.setSingleLine(true); textInput.setBackground(outline(PANEL,Color.rgb(61,82,104),14)); root.addView(textInput,new LinearLayout.LayoutParams(-1,dp(56)));
+        LinearLayout kb=row();Button send=button("Enviar texto",BLUE);send.setOnClickListener(v->sendKeyboard());Button apps=button("Configurar APP 1/2",BTN);apps.setOnClickListener(v->configureCustom(1));flex(kb,send,56);flex(kb,apps,56);root.addView(kb);
+        TextView n=text("Mantén pulsado el botón azul de voz mientras hablas. El audio se envía directamente al canal de voz del Fire TV a 16 kHz mono.",12,MUTED,false);n.setGravity(Gravity.CENTER);root.addView(n);
     }
 
-    private void startVoice() {
-        try {
-            Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-            i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
-            i.putExtra(RecognizerIntent.EXTRA_PROMPT, "Habla");
-            startActivityForResult(i, VOICE_REQ);
-        } catch (Exception e) {
-            Toast.makeText(this, "El reconocimiento de voz no está disponible en este móvil", Toast.LENGTH_SHORT).show();
-        }
+    private Button app(String label,String[] packages){ Button b=button(label,BTN); b.setOnClickListener(v->launchFirst(packages)); return b; }
+    private Button customApp(int slot){
+        String name=prefs.getString("app_name_"+slot,"APP "+slot); Button b=button(name,BTN);
+        b.setOnClickListener(v->{String p=prefs.getString("app_pkg_"+slot,"");if(p.isEmpty())configureCustom(slot);else launchFirst(new String[]{p});});
+        b.setOnLongClickListener(v->{configureCustom(slot);return true;}); return b;
     }
-
-    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == VOICE_REQ && resultCode == RESULT_OK && data != null) {
-            ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
-            if (results != null && !results.isEmpty()) {
-                final String spoken = results.get(0);
-                key(84);
-                ui.postDelayed(() -> sendTextValue(spoken), 180);
-            }
-        }
-    }
-
-    private void sendText() {
-        if (textInput != null) sendTextValue(textInput.getText().toString());
-    }
-
-    private void sendTextValue(String raw) {
-        if (raw == null || raw.trim().isEmpty()) return;
-        String escaped = raw.trim().replace("\\", "\\\\").replace("'", "\\'").replace(" ", "%s");
-        sendCommand("input text '" + escaped + "'");
-    }
-
-    private void key(int code) { sendCommand("input keyevent " + code); }
-
-    private void sendCommand(String command) {
-        if (adb == null) return;
-        control.execute(() -> {
-            try { adb.shell(command); }
-            catch (Exception e) { runOnUiThread(() -> Toast.makeText(this, "Conexión perdida", Toast.LENGTH_SHORT).show()); }
+    private void launchFirst(String[] packages){ if(packages.length==0)return; launchTry(packages,0); }
+    private void launchTry(String[] packages,int i){
+        if(i>=packages.length)return; final String h=host,t=token,pkg=packages[i]; control.execute(()->{
+            try{Request q=new Request.Builder().url("https://"+h+":8080/v1/FireTV/app/"+pkg).header("X-Api-Key",API_KEY).header("X-Client-Token",t).post(RequestBody.create(new byte[0],null)).build();Response r=http.newCall(q).execute();boolean ok=r.isSuccessful();r.close();if(!ok)runOnUiThread(()->launchTry(packages,i+1));}catch(Exception e){runOnUiThread(()->launchTry(packages,i+1));}
         });
     }
 
-    private boolean portOpen(String host, int port, int timeoutMs) {
-        try (Socket s = new Socket()) {
-            s.connect(new InetSocketAddress(host, port), timeoutMs);
-            return true;
-        } catch (Exception e) { return false; }
+    private void configureCustom(int slot){
+        discovery.execute(()->{
+            List<String> names=new ArrayList<>(), pkgs=new ArrayList<>();
+            try{Request q=new Request.Builder().url("https://"+host+":8080/v1/FireTV/appsV2").header("X-Api-Key",API_KEY).header("X-Client-Token",token).build();Response r=http.newCall(q).execute();String body=r.body()!=null?r.body().string():"";r.close();JSONArray a=new JSONArray(body);for(int i=0;i<a.length();i++){JSONObject o=a.optJSONObject(i);if(o==null)continue;String id=o.optString("appId","");String n=o.optString("name",id);if(!id.isEmpty()){names.add(n);pkgs.add(id);}}}catch(Exception ignored){}
+            runOnUiThread(()->{
+                if(names.isEmpty()){showManualApp(slot);return;}
+                String[] arr=names.toArray(new String[0]); new AlertDialog.Builder(this).setTitle("APP "+slot+" · elige aplicación").setItems(arr,(d,w)->{prefs.edit().putString("app_name_"+slot,names.get(w)).putString("app_pkg_"+slot,pkgs.get(w)).apply();showRemote(host);}).setNeutralButton("Introducir paquete",(d,w)->showManualApp(slot)).show();
+            });
+        });
+    }
+    private void showManualApp(int slot){ EditText e=new EditText(this);e.setHint("com.ejemplo.app");new AlertDialog.Builder(this).setTitle("APP "+slot).setMessage("Introduce el identificador de paquete de la aplicación.").setView(e).setNegativeButton("Cancelar",null).setPositiveButton("Guardar",(d,w)->{String p=e.getText().toString().trim();if(!p.isEmpty()){prefs.edit().putString("app_name_"+slot,"APP "+slot).putString("app_pkg_"+slot,p).apply();showRemote(host);}}).show(); }
+
+    private void sendKeyboard(){ if(textInput==null)return;String s=textInput.getText().toString();if(s.isEmpty())return;send("/v1/FireTV/keyboard","{\"text\":"+JSONObject.quote(s)+"}"); }
+
+    private void startVoice(){
+        if(voiceActive||host==null||token==null)return;
+        if(checkSelfPermission(Manifest.permission.RECORD_AUDIO)!=PackageManager.PERMISSION_GRANTED){requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},MIC_REQ);Toast.makeText(this,"Concede permiso de micrófono y mantén pulsado otra vez",Toast.LENGTH_SHORT).show();return;}
+        voiceActive=true;
+        control.execute(()->{
+            try{Response r=call(host,"/v1/FireTV/voiceCommand?action=start",true,"",token).execute();r.close();}catch(Exception ignored){}
+            Request req=new Request.Builder().url("wss://"+host+":9090/").build();
+            voiceSocket=http.newWebSocket(req,new WebSocketListener(){@Override public void onOpen(WebSocket ws,Response response){voiceSocket=ws;beginAudio(ws);}});
+        });
+    }
+    private void beginAudio(WebSocket ws){
+        audioExec.execute(()->{
+            try{
+                int min=AudioRecord.getMinBufferSize(16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT);int size=Math.max(2048,min);
+                recorder=new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,16000,AudioFormat.CHANNEL_IN_MONO,AudioFormat.ENCODING_PCM_16BIT,size*2);
+                byte[] buf=new byte[640];recorder.startRecording();
+                while(voiceActive){int n=recorder.read(buf,0,buf.length);if(n>0)ws.send(ByteString.of(buf,0,n));}
+            }catch(Exception ignored){}finally{try{if(recorder!=null){recorder.stop();recorder.release();}}catch(Exception ignored){}recorder=null;}
+        });
+    }
+    private void stopVoice(){
+        if(!voiceActive)return;voiceActive=false;try{if(voiceSocket!=null)voiceSocket.close(1000,"done");}catch(Exception ignored){}voiceSocket=null;
+        control.execute(()->{try{Response r=call(host,"/v1/FireTV/voiceCommand?action=stop",true,"",token).execute();r.close();}catch(Exception ignored){}});
     }
 
-    private String localIpv4() {
-        try {
-            for (NetworkInterface ni : Collections.list(NetworkInterface.getNetworkInterfaces())) {
-                if (!ni.isUp() || ni.isLoopback()) continue;
-                for (java.net.InetAddress a : Collections.list(ni.getInetAddresses())) {
-                    if (a instanceof Inet4Address && !a.isLoopbackAddress() && a.isSiteLocalAddress()) return a.getHostAddress();
-                }
-            }
-        } catch (Exception ignored) {}
-        return null;
-    }
+    private boolean portOpen(String h,int port,int timeout){try(Socket s=new Socket()){s.connect(new InetSocketAddress(h,port),timeout);return true;}catch(Exception e){return false;}}
+    private String localIpv4(){try{for(NetworkInterface ni:Collections.list(NetworkInterface.getNetworkInterfaces())){if(!ni.isUp()||ni.isLoopback())continue;for(java.net.InetAddress a:Collections.list(ni.getInetAddresses()))if(a instanceof Inet4Address&&!a.isLoopbackAddress()&&a.isSiteLocalAddress())return a.getHostAddress();}}catch(Exception ignored){}return null;}
 
-    @Override protected void onDestroy() {
-        super.onDestroy();
-        scanning = false;
-        discovery.shutdownNow();
-        control.shutdownNow();
-        try { if (adb != null) adb.close(); } catch (Exception ignored) {}
-    }
+    @Override protected void onDestroy(){super.onDestroy();voiceActive=false;discovery.shutdownNow();control.shutdownNow();audioExec.shutdownNow();if(http!=null)http.dispatcher().executorService().shutdown();}
 }
