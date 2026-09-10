@@ -394,13 +394,13 @@ public class MainActivity extends Activity {
     private Button customButton(int slot) {
         String label = prefs.getString("custom" + slot + "_label", "APP " + slot);
         String pkg = prefs.getString("custom" + slot + "_pkg", "");
-        Button b = appButton(label, () -> {
+        Button b = button(pkg.isEmpty() ? "+ APP " + slot : label, Color.rgb(28, 68, 112));
+        b.setOnClickListener(v -> {
             String p = prefs.getString("custom" + slot + "_pkg", "");
             if (p.isEmpty()) configureCustom(slot, b);
             else launchCandidates("custom" + slot, new String[]{p});
         });
         b.setOnLongClickListener(v -> { configureCustom(slot, b); return true; });
-        if (pkg.isEmpty()) b.setText("+ APP " + slot);
         return b;
     }
 
