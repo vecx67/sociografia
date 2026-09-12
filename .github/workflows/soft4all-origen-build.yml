@@ -1,0 +1,58 @@
+name: Soft4All Origen APK
+
+on:
+  push:
+    branches:
+      - soft4all-origen-build-4
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle 8.11.1
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.11.1'
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;35.0.0" "platform-tools"
+
+      - name: Restore app project
+        shell: bash
+        run: |
+          mkdir -p soft4all-origen
+          base64 -d ci/soft4all_origen_project.b64 > /tmp/soft4all-origen.zip
+          unzip -q /tmp/soft4all-origen.zip -d soft4all-origen
+
+      - name: Build debug APK
+        working-directory: soft4all-origen
+        run: gradle --no-daemon clean assembleDebug
+
+      - name: Rename APK
+        shell: bash
+        run: |
+          cp soft4all-origen/app/build/outputs/apk/debug/app-debug.apk Soft4AllOrigen-v1.0.0-test.apk
+          sha256sum Soft4AllOrigen-v1.0.0-test.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Soft4AllOrigen-v1.0.0-test
+          path: Soft4AllOrigen-v1.0.0-test.apk
+          if-no-files-found: error
+          retention-days: 7
