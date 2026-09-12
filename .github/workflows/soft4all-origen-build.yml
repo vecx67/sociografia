@@ -39,6 +39,7 @@ jobs:
           cat ci/parts/part00.b64 ci/parts/part01.b64 ci/parts/part02.b64 ci/parts/part03.b64 ci/parts/part04.b64 ci/parts/part05.b64 ci/parts/part06.b64 ci/parts/part07.b64 | base64 -d > /tmp/soft4all-origen.zip
           unzip -t /tmp/soft4all-origen.zip
           unzip -q /tmp/soft4all-origen.zip -d soft4all-origen
+          sed -i 's/com\.google\.android\.gms\.mlkit\.vision\.codescanner/com.google.mlkit.vision.codescanner/g' soft4all-origen/app/src/main/java/com/soft4all/origen/ui/MainActivity.java
 
       - name: Build debug APK
         working-directory: soft4all-origen
